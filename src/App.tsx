@@ -9,10 +9,11 @@ import {
 import { Link, NavLink, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   analyzeDraft, createDraft, getAudit, getDashboard, getDraft, getDrafts,
-  getFindings, getIntelligenceStatus, getRules, reviewDraft, addEvidence,
+  getFindings, getGovernanceLearning, getIntelligenceStatus, getRules, reviewDraft, addEvidence,
+  recordGovernanceLearning,
   askAssistant, decideProposedEdit, reviseDraft, createRule, updateRule, getRuleRevisions,
 } from './api'
-import type { AuditEvent, Dashboard, Draft, Finding, IntelligenceStatus, Rule, RuleCategory, RuleRevision } from './types'
+import type { AuditEvent, Dashboard, Draft, Finding, GovernanceLearning, IntelligenceStatus, Rule, RuleCategory, RuleRevision } from './types'
 import './App.css'
 import './workspace.css'
 
@@ -612,10 +613,25 @@ function RulesPage({ rules, onMutation }: { rules: Rule[]; onMutation: () => Pro
 
 function AuditPage({ events }: { events: AuditEvent[] }) {
   const [query, setQuery] = useState('')
+  const [learning, setLearning] = useState<GovernanceLearning | null>(null)
+  const [learningError, setLearningError] = useState('')
+  useEffect(() => {
+    getGovernanceLearning()
+      .then(setLearning)
+      .catch((cause: unknown) => setLearningError(cause instanceof Error ? cause.message : 'Learning summary is unavailable.'))
+  }, [])
   const filtered = events.filter((event) => `${event.action} ${event.actor} ${event.target_title} ${event.details}`.toLowerCase().includes(query.toLowerCase()))
   const auditIcon = (action: string) => action.includes('approved') ? <Check size={15} /> : action.includes('rejected') ? <X size={15} /> : action.includes('change') ? <AlertCircle size={15} /> : action.includes('analyzed') ? <Sparkles size={15} /> : <FileText size={15} />
   return <>
-    <PageHeader title="Audit history" description="A durable, chronological record of governance activity." />
+    <PageHeader title="Audit history" description="Chronological governance activity stored in the configured database." />
+    <section className="panel learning-panel" aria-labelledby="learning-heading">
+      <div className="panel-heading"><div><h2 id="learning-heading">Governance learning suggestions</h2><p>Patterns in completed review decisions can prompt human policy review. No rules change automatically.</p></div></div>
+      {learningError ? <p className="learning-note" role="status">Unable to load suggestions: {learningError}</p> : !learning ? <p className="learning-note">Loading review patterns…</p> : <>
+        <div className="learning-actions"><p className="learning-note">Based on {learning.basis.completed_decisions} latest completed decisions from the past {learning.window.days} days. {learning.notice} Actor labels are not authenticated.</p><button className="button button-quiet" onClick={() => void recordGovernanceLearning().then(setLearning).catch((cause: unknown) => setLearningError(cause instanceof Error ? cause.message : 'Unable to record snapshot.'))}>Record snapshot</button></div>
+        {learning.run_id !== null && <p className="learning-note">Recorded snapshot #{learning.run_id} at {timeLabel(learning.recorded_at ?? '')}.</p>}
+        {learning.recommendations.length ? <div className="learning-list">{learning.recommendations.map((item) => <article className="learning-item" key={item.key}><strong>{item.recommendation}</strong><p>{item.basis.finding_title} · {item.basis.draft_ids.length} reviewed submissions · policy #{item.basis.policy_id ?? 'unlinked'}</p><small>Drafts {item.basis.draft_ids.map((id) => `#${id}`).join(', ')} · findings {item.basis.finding_ids.map((id) => `#${id}`).join(', ')} · decisions {item.basis.decision_ids.map((id) => `#${id}`).join(', ')}</small></article>)}</div> : <p className="learning-note">No repeated finding patterns across at least two completed reviews in this window.</p>}
+      </>}
+    </section>
     <section className="panel full-panel"><div className="list-toolbar"><div className="search-box"><Search size={16} /><input aria-label="Search audit history" placeholder="Search activity…" value={query} onChange={(event) => setQuery(event.target.value)} /></div><span className="result-count">{filtered.length} events</span></div>{filtered.length ? <div className="audit-list">{filtered.map((event) => <article className="audit-event" key={event.id}><span className={`audit-event-icon ${event.action.includes('approved') ? 'audit-green' : event.action.includes('rejected') ? 'audit-red' : ''}`}>{auditIcon(event.action)}</span><div className="audit-copy"><strong>{event.action}</strong><span>{event.target_title}{event.details ? ` · ${event.details}` : ''}</span><small>{event.actor}</small></div><time>{timeLabel(event.created_at)}</time></article>)}</div> : <EmptyState icon={Activity} title="No audit events found" description={events.length ? 'Try adjusting your search.' : 'Draft submissions, analyses and review decisions will be recorded here.'} />}</section>
   </>
 }

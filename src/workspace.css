@@ -213,3 +213,10 @@
   .review-actions { align-items: stretch; }
   .review-action-group { grid-template-columns: 1fr 1fr; }
 }
+.learning-panel { margin-bottom: 18px; }
+.learning-actions { align-items: center; display: flex; gap: 12px; justify-content: space-between; }
+.learning-note { color: var(--muted, #667085); font-size: 13px; line-height: 1.55; margin: 8px 0; }
+.learning-list { display: grid; gap: 10px; margin-top: 14px; }
+.learning-item { border: 1px solid var(--line, #e5e7eb); border-radius: 10px; padding: 13px 15px; }
+.learning-item strong { font-size: 13px; }
+.learning-item p, .learning-item small { color: var(--muted, #667085); display: block; font-size: 12px; line-height: 1.5; margin: 6px 0 0; }

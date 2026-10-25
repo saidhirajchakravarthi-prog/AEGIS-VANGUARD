@@ -144,6 +144,33 @@ export interface AuditEvent {
   created_at: string
 }
 
+export interface GovernanceLearning {
+  run_id: number | null
+  recorded_at: string | null
+  window: { starts_at: string; ends_at: string; days: number }
+  basis: {
+    method: string
+    completed_decisions: number
+    decision_ids: number[]
+    unverified_actor_labels: boolean
+  }
+  recommendations: Array<{
+    key: string
+    recommendation: string
+    basis: {
+      policy_id: number | null
+      category: string
+      finding_title: string
+      draft_ids: number[]
+      finding_ids: number[]
+      decision_ids: number[]
+    }
+    requires_human_policy_review: boolean
+    automatically_applied: false
+  }>
+  notice: string
+}
+
 export interface Dashboard {
   total_submissions: number
   in_review: number

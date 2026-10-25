@@ -2,6 +2,12 @@
   "buildCommand": "npm run build",
   "installCommand": "npm ci",
   "outputDirectory": "dist",
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 30,
+      "includeFiles": "{alembic.ini,backend/migrations/**}"
+    }
+  },
   "rewrites": [
     {
       "source": "/api/(.*)",

@@ -3,7 +3,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from sqlalchemy import create_engine, func, select
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, func, inspect, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from pydantic import ValidationError
@@ -35,6 +37,7 @@ from main import (
 from intelligence import (
     AnalysisOutput,
     ClaimFinding,
+    OpenAIProvider,
     classify_provider_error,
     configured_provider,
     validate_analysis_references,
@@ -247,6 +250,15 @@ class GovernanceWorkflowTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertIsNone(configured_provider())
 
+    def test_openai_client_uses_a_bounded_timeout_without_retries(self) -> None:
+        with patch("openai.OpenAI") as openai_client:
+            OpenAIProvider("unit-test-key", "unit-test-model")._client()
+        openai_client.assert_called_once_with(
+            api_key="unit-test-key",
+            timeout=20,
+            max_retries=0,
+        )
+
     def test_evidence_cannot_be_marked_reviewed_without_human_verification(self) -> None:
         output = MockAnalysisProvider().analyze(
             content="We delivered 25% growth.",
@@ -311,7 +323,7 @@ class ApiWorkflowTests(unittest.TestCase):
         self.temp_dir = TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         database_path = Path(self.temp_dir.name) / "api-test.db"
-        self.app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider())
+        self.app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider(), initialize_schema=True)
         self.addCleanup(self.app.state.engine.dispose)
         self.client = TestClient(self.app)
         self.addCleanup(self.client.close)
@@ -320,7 +332,7 @@ class ApiWorkflowTests(unittest.TestCase):
         origin = "https://aegis-frontend.up.railway.app"
         database_path = Path(self.temp_dir.name) / "cors-test.db"
         with patch.dict("os.environ", {"AEGIS_CORS_ORIGINS": f"{origin}/"}):
-            app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider())
+            app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider(), initialize_schema=True)
         try:
             with TestClient(app) as client:
                 response = client.options(
@@ -333,6 +345,215 @@ class ApiWorkflowTests(unittest.TestCase):
             self.assertEqual(response.headers.get("access-control-allow-origin"), origin)
         finally:
             app.state.engine.dispose()
+
+    def test_created_rule_and_initial_history_are_persisted_together(self) -> None:
+        response = self.client.post("/api/brand-rules", json={
+            "name": "Campaign vocabulary",
+            "category": "terminology",
+            "term": "best ever",
+            "replacement": "",
+            "description": "Review superlative language.",
+            "enabled": True,
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        rule = response.json()
+        versions = self.client.get(f"/api/brand-rules/{rule['id']}/versions")
+        self.assertEqual(versions.status_code, 200)
+        self.assertEqual([item["version"] for item in versions.json()], [1])
+        self.assertEqual(versions.json()[0]["rule"]["name"], rule["name"])
+        self.assertTrue(any(
+            event["action"] == "Brand rule created" and event["target_id"] == rule["id"]
+            for event in self.client.get("/api/audit").json()
+        ))
+
+    def test_review_patterns_return_traceable_human_only_recommendations(self) -> None:
+        draft_ids = []
+        for index, action in enumerate(("approve", "reject"), start=1):
+            created = self.client.post("/api/submissions", json={
+                "title": f"Recurring claim {index}",
+                "author": "Local reviewer",
+                "channel": "Website",
+                "content": "Guaranteed returns of 25% for every customer.",
+            })
+            self.assertEqual(created.status_code, 201, created.text)
+            draft_id = created.json()["id"]
+            draft_ids.append(draft_id)
+            analyzed = self.client.post(f"/api/drafts/{draft_id}/analyze")
+            self.assertEqual(analyzed.status_code, 200, analyzed.text)
+            reviewed = self.client.post(f"/api/drafts/{draft_id}/review", json={"action": action})
+            self.assertEqual(reviewed.status_code, 200, reviewed.text)
+
+        response = self.client.get("/api/governance/learning?days=30")
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["window"]["days"], 30)
+        self.assertEqual(payload["basis"]["completed_decisions"], 2)
+        self.assertTrue(payload["basis"]["unverified_actor_labels"])
+        recommendation = next(
+            item for item in payload["recommendations"]
+            if item["basis"]["category"] == "terminology"
+        )
+        self.assertEqual(set(recommendation["basis"]["draft_ids"]), set(draft_ids))
+        self.assertEqual(len(recommendation["basis"]["finding_ids"]), 2)
+        self.assertTrue(recommendation["requires_human_policy_review"])
+        self.assertFalse(recommendation["automatically_applied"])
+
+        recorded = self.client.post("/api/governance/learning?days=30")
+        self.assertEqual(recorded.status_code, 200, recorded.text)
+        snapshot = recorded.json()
+        self.assertIsInstance(snapshot["run_id"], int)
+        history = self.client.get("/api/governance/learning/runs").json()
+        self.assertEqual(history[0]["run_id"], snapshot["run_id"])
+        self.assertEqual(history[0]["basis"]["decision_ids"], snapshot["basis"]["decision_ids"])
+        self.assertTrue(any(
+            event["target_type"] == "governance_learning_run" and event["target_id"] == snapshot["run_id"]
+            for event in self.client.get("/api/audit").json()
+        ))
+
+    def test_health_reports_sqlite_and_migration_status_without_claiming_durability(self) -> None:
+        status = self.client.get("/api/health").json()
+        self.assertEqual(status["database"]["kind"], "sqlite")
+        self.assertFalse(status["database"]["persistent_database_configured"])
+        self.assertEqual(status["database"]["durability"], "managed_database_required")
+
+    def test_vercel_refuses_to_start_without_explicit_database_url(self) -> None:
+        with patch.dict("os.environ", {"VERCEL": "1"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "AEGIS_DATABASE_URL is required on Vercel"):
+                create_app()
+
+    def test_alembic_upgrade_creates_schema_and_is_repeatable(self) -> None:
+        database_path = Path(self.temp_dir.name) / "migration-test.db"
+        database_url = f"sqlite:///{database_path.as_posix()}"
+        config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        with patch.dict("os.environ", {"AEGIS_DATABASE_URL": database_url}, clear=False):
+            command.upgrade(config, "head")
+            command.upgrade(config, "head")
+        engine = create_engine(database_url)
+        try:
+            inspector = inspect(engine)
+            self.assertIn("alembic_version", inspector.get_table_names())
+            columns = {column["name"] for column in inspector.get_columns("analysis_runs")}
+            self.assertTrue({"failure_code", "evidence_version"}.issubset(columns))
+            with sessionmaker(bind=engine)() as db:
+                self.assertGreater(db.scalar(select(func.count()).select_from(BrandRuleModel)), 0)
+        finally:
+            engine.dispose()
+
+    def test_vercel_sqlite_demo_applies_versioned_migration_and_reports_ephemeral_storage(self) -> None:
+        database_path = Path(self.temp_dir.name) / "vercel-demo.db"
+        database_url = f"sqlite:///{database_path.as_posix()}"
+        with patch.dict("os.environ", {"VERCEL": "1", "AEGIS_DATABASE_URL": database_url}, clear=False):
+            app = create_app(database_url)
+        try:
+            with TestClient(app) as client:
+                health = client.get("/api/health").json()
+                self.assertTrue(health["database"]["migrations_applied"])
+                self.assertFalse(health["database"]["persistent_database_configured"])
+                self.assertGreater(len(client.get("/api/brand-rules").json()), 0)
+        finally:
+            app.state.engine.dispose()
+
+    def test_adoption_migration_preserves_legacy_rule_and_adds_missing_columns(self) -> None:
+        database_path = Path(self.temp_dir.name) / "legacy-migration.db"
+        database_url = f"sqlite:///{database_path.as_posix()}"
+        engine = create_engine(database_url)
+        Base.metadata.create_all(
+            engine,
+            tables=[table for table in Base.metadata.sorted_tables if table.name != "governance_learning_runs"],
+        )
+        with sessionmaker(bind=engine)() as db:
+            db.add(BrandRuleModel(
+                name="Existing legacy rule", category="terminology", term="legacy",
+                replacement="", description="Keep this policy.", enabled=True,
+            ))
+            db.commit()
+        with engine.begin() as connection:
+            connection.exec_driver_sql("ALTER TABLE analysis_runs DROP COLUMN failure_code")
+            connection.exec_driver_sql("ALTER TABLE analysis_runs DROP COLUMN evidence_version")
+            connection.exec_driver_sql("ALTER TABLE findings DROP COLUMN policy_id")
+        engine.dispose()
+
+        config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+        with patch.dict("os.environ", {"AEGIS_DATABASE_URL": database_url}, clear=False):
+            command.upgrade(config, "head")
+        engine = create_engine(database_url)
+        try:
+            with sessionmaker(bind=engine)() as db:
+                rule = db.scalar(select(BrandRuleModel).where(BrandRuleModel.name == "Existing legacy rule"))
+                self.assertIsNotNone(rule)
+                self.assertEqual(db.scalar(select(func.count()).select_from(BrandRuleModel)), 1)
+            self.assertTrue({"failure_code", "evidence_version"}.issubset(
+                {column["name"] for column in inspect(engine).get_columns("analysis_runs")}
+            ))
+            self.assertIn("policy_id", {column["name"] for column in inspect(engine).get_columns("findings")})
+        finally:
+            engine.dispose()
+
+    def test_failed_initial_rule_history_write_rolls_back_the_rule(self) -> None:
+        rule_input = {
+            "name": "Must roll back",
+            "category": "terminology",
+            "term": "must not persist",
+            "replacement": "",
+            "description": "Used to check transaction boundaries.",
+            "enabled": True,
+        }
+        with patch("main.record_rule_revision", side_effect=RuntimeError("revision write failed")):
+            with self.assertRaises(RuntimeError):
+                self.client.post("/api/brand-rules", json=rule_input)
+        names = {rule["name"] for rule in self.client.get("/api/brand-rules").json()}
+        self.assertNotIn(rule_input["name"], names)
+        self.assertFalse(any(
+            event["target_title"] == rule_input["name"]
+            for event in self.client.get("/api/audit").json()
+        ))
+
+    def test_last_successful_ai_request_survives_a_later_timeout(self) -> None:
+        created = self.client.post("/api/submissions", json={
+            "title": "Provider status history",
+            "author": "Local reviewer",
+            "channel": "Website",
+            "content": "We reported 25% growth.",
+        })
+        self.assertEqual(created.status_code, 201, created.text)
+        draft_id = created.json()["id"]
+
+        successful = self.client.post(f"/api/drafts/{draft_id}/analyze")
+        self.assertEqual(successful.status_code, 200, successful.text)
+        status_after_success = self.client.get("/api/intelligence/status").json()
+        last_success = status_after_success["last_successful_request_at"]
+        self.assertIsNotNone(last_success)
+
+        with patch.object(self.app.state.analysis_provider, "analyze", side_effect=TimeoutError("private provider detail")):
+            failed = self.client.post(f"/api/drafts/{draft_id}/analyze")
+        self.assertEqual(failed.status_code, 200, failed.text)
+        status_after_failure = self.client.get("/api/intelligence/status").json()
+        self.assertEqual(status_after_failure["last_request_status"], "provider_error")
+        self.assertFalse(status_after_failure["last_request_succeeded"])
+        self.assertEqual(status_after_failure["last_successful_request_at"], last_success)
+
+    def test_file_database_data_survives_api_app_restart_on_same_host(self) -> None:
+        database_path = Path(self.temp_dir.name) / "restart-test.db"
+        first_app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider(), initialize_schema=True)
+        try:
+            with TestClient(first_app) as client:
+                created = client.post("/api/submissions", json={
+                    "title": "Same filesystem persistence",
+                    "author": "Local reviewer",
+                    "channel": "Website",
+                    "content": "This local record should survive an app restart.",
+                })
+                self.assertEqual(created.status_code, 201, created.text)
+        finally:
+            first_app.state.engine.dispose()
+
+        second_app = create_app(f"sqlite:///{database_path}", provider=MockAnalysisProvider(), initialize_schema=True)
+        try:
+            with TestClient(second_app) as client:
+                rows = client.get("/api/drafts").json()
+                self.assertTrue(any(row["title"] == "Same filesystem persistence" for row in rows))
+        finally:
+            second_app.state.engine.dispose()
 
     def test_mocked_ai_evidence_rewrite_review_and_audit_workflow_over_http(self) -> None:
         created = self.client.post("/api/submissions", json={
@@ -505,7 +726,7 @@ class ApiWorkflowTests(unittest.TestCase):
 
     def test_rules_only_assistant_is_explicit_when_no_provider_is_configured(self) -> None:
         with TemporaryDirectory() as temp_dir, patch.dict("os.environ", {}, clear=True):
-            app = create_app(f"sqlite:///{Path(temp_dir) / 'rules-only.db'}")
+            app = create_app(f"sqlite:///{Path(temp_dir) / 'rules-only.db'}", initialize_schema=True)
             try:
                 with TestClient(app) as client:
                     draft_id = client.post("/api/submissions", json={

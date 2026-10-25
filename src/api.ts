@@ -1,4 +1,4 @@
-import type { AssistantResult, AuditEvent, Dashboard, Draft, Finding, IntelligenceStatus, Rule, RuleInput, RuleRevision } from './types'
+import type { AssistantResult, AuditEvent, Dashboard, Draft, Finding, GovernanceLearning, IntelligenceStatus, Rule, RuleInput, RuleRevision } from './types'
 
 const API_BASE = import.meta.env.VITE_API_URL
   ?? (import.meta.env.PROD ? '/api' : 'http://127.0.0.1:8000/api')
@@ -29,6 +29,8 @@ export const getDraft = (id: string | number) => request<Draft>(`/drafts/${id}`)
 export const getRules = () => request<Rule[]>('/brand-rules')
 export const getFindings = () => request<Finding[]>('/findings')
 export const getAudit = () => request<AuditEvent[]>('/audit')
+export const getGovernanceLearning = () => request<GovernanceLearning>('/governance/learning')
+export const recordGovernanceLearning = () => request<GovernanceLearning>('/governance/learning', { method: 'POST' })
 export const getIntelligenceStatus = () => request<IntelligenceStatus>('/intelligence/status')
 export const createDraft = (input: { title: string; author: string; channel: string; content: string; evidence_reference: string }) =>
   request<Draft>('/submissions', { method: 'POST', body: JSON.stringify(input) })

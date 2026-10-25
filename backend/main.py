@@ -3,14 +3,14 @@ from __future__ import annotations
 import os
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Generator, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, inspect, select, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, create_engine, func, inspect, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from intelligence import (
@@ -187,6 +187,18 @@ class RuleRevisionModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
 
 
+class GovernanceLearningRunModel(Base):
+    __tablename__ = "governance_learning_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    window_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    window_starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    window_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    basis_json: Mapped[str] = mapped_column(Text, nullable=False)
+    recommendations_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class DraftInput(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -343,6 +355,33 @@ def current_policy_version(db: Session) -> int:
     )
 
 
+def _analysis_sort_key(run: AnalysisRunModel) -> tuple[datetime, int]:
+    created_at = run.created_at
+    if created_at.tzinfo is None or created_at.utcoffset() is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return created_at, run.id
+
+
+def _latest_analysis_for_draft(draft: DraftModel) -> AnalysisRunModel | None:
+    return max(draft.analysis_runs, key=_analysis_sort_key, default=None)
+
+
+def _migration_status(engine) -> dict[str, object]:
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    head = ScriptDirectory.from_config(config).get_current_head()
+    inspector = inspect(engine)
+    current = None
+    if "alembic_version" in inspector.get_table_names():
+        with engine.connect() as connection:
+            current = connection.exec_driver_sql(
+                "SELECT version_num FROM alembic_version LIMIT 1"
+            ).scalar_one_or_none()
+    return {"migrations_applied": current == head, "migration_current": current, "migration_head": head}
+
+
 def latest_analysis_runs(db: Session, include_stale: bool = False) -> list[AnalysisRunModel]:
     latest_by_draft: dict[int, AnalysisRunModel] = {}
     for run in db.scalars(
@@ -369,7 +408,7 @@ def latest_analysis_runs(db: Session, include_stale: bool = False) -> list[Analy
 
 
 def _draft_dict(draft: DraftModel, policy_version: int | None = None) -> dict[str, object]:
-    latest = max(draft.analysis_runs, key=lambda run: (run.created_at, run.id), default=None)
+    latest = _latest_analysis_for_draft(draft)
     content_version = max((version.version for version in draft.versions), default=1)
     analysis = None
     if latest is not None:
@@ -655,7 +694,7 @@ def decide_proposed_edit(db: Session, edit_id: int, data: EditDecisionInput) -> 
         raise HTTPException(status_code=409, detail="Edits cannot be applied after a final review decision.")
     if edit.status != "proposed":
         raise HTTPException(status_code=409, detail="This proposed edit already has a decision.")
-    latest_analysis = max(draft.analysis_runs, key=lambda run: (run.created_at, run.id), default=None)
+    latest_analysis = _latest_analysis_for_draft(draft)
     current_version = max((version.version for version in draft.versions), default=1)
     if (
         latest_analysis is None
@@ -713,7 +752,7 @@ def record_review(db: Session, draft_id: int, review: ReviewInput) -> DraftModel
     draft = _get_draft(db, draft_id)
     if draft.status != "In review":
         raise HTTPException(status_code=409, detail="Only submissions in the review queue can receive a decision.")
-    latest_analysis = max(draft.analysis_runs, key=lambda run: (run.created_at, run.id), default=None)
+    latest_analysis = _latest_analysis_for_draft(draft)
     current_version = max((version.version for version in draft.versions), default=1)
     if (
         latest_analysis is None
@@ -762,45 +801,61 @@ DEFAULT_RULES = [
 ]
 
 
-def create_app(database_url: str | None = None, provider: AnalysisProvider | None = None) -> FastAPI:
-    url = database_url or os.environ.get(
-        "AEGIS_DATABASE_URL",
-        f"sqlite:///{(Path(__file__).resolve().parent / 'aegis.db').as_posix()}",
-    )
+def create_app(
+    database_url: str | None = None,
+    provider: AnalysisProvider | None = None,
+    *,
+    initialize_schema: bool = False,
+) -> FastAPI:
+    configured_database_url = database_url or os.environ.get("AEGIS_DATABASE_URL")
+    if configured_database_url is None and os.getenv("VERCEL"):
+        raise RuntimeError(
+            "AEGIS_DATABASE_URL is required on Vercel. Configure a managed persistent database; "
+            "SQLite under /tmp is ephemeral and cannot store governance history reliably."
+        )
+    url = configured_database_url or f"sqlite:///{(Path(__file__).resolve().parent / 'aegis.db').as_posix()}"
+    if url.startswith("postgres://"):
+        url = "postgresql+psycopg://" + url.removeprefix("postgres://")
+    elif url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url.removeprefix("postgresql://")
     connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    engine = create_engine(url, connect_args=connect_args)
+    engine = create_engine(url, connect_args=connect_args, pool_pre_ping=True)
+    if os.getenv("VERCEL") and engine.dialect.name == "sqlite":
+        # Temporary Vercel demo databases are per-instance. Use the versioned
+        # migration path so a cold instance can serve the demo; this does not
+        # make its records durable or suitable for governance history.
+        from alembic import command
+        from alembic.config import Config
+
+        migration_config = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+        command.upgrade(migration_config, "head")
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    Base.metadata.create_all(engine)
-    if engine.dialect.name == "sqlite":
-        analysis_columns = {
-            column["name"] for column in inspect(engine).get_columns("analysis_runs")
-        }
-        if "failure_code" not in analysis_columns:
-            with engine.begin() as connection:
-                connection.execute(text("ALTER TABLE analysis_runs ADD COLUMN failure_code VARCHAR(40)"))
-        if "evidence_version" not in analysis_columns:
-            with engine.begin() as connection:
-                connection.execute(text("ALTER TABLE analysis_runs ADD COLUMN evidence_version INTEGER NOT NULL DEFAULT 0"))
-        finding_columns = {column["name"] for column in inspect(engine).get_columns("findings")}
-        if "policy_id" not in finding_columns:
-            with engine.begin() as connection:
-                connection.execute(text("ALTER TABLE findings ADD COLUMN policy_id INTEGER"))
-    with factory() as db:
-        if db.scalar(select(func.count()).select_from(BrandRuleModel)) == 0:
-            db.add_all(BrandRuleModel(**rule) for rule in DEFAULT_RULES)
-            db.commit()
-        rules_without_history = list(db.scalars(
-            select(BrandRuleModel).where(
-                ~BrandRuleModel.id.in_(select(RuleRevisionModel.rule_id))
-            )
-        ))
-        for rule in rules_without_history:
-            record_rule_revision(db, rule, "Aegis system")
-        if rules_without_history:
-            db.commit()
+    if initialize_schema:
+        # Explicit test-only convenience; deployed/local app startup requires
+        # `alembic upgrade head` and never mutates schema implicitly.
+        Base.metadata.create_all(engine)
+        with factory() as db:
+            if db.scalar(select(func.count()).select_from(BrandRuleModel)) == 0:
+                db.add_all(BrandRuleModel(**rule) for rule in DEFAULT_RULES)
+                db.commit()
+            rules_without_history = list(db.scalars(
+                select(BrandRuleModel).where(
+                    ~BrandRuleModel.id.in_(select(RuleRevisionModel.rule_id))
+                )
+            ))
+            for rule in rules_without_history:
+                record_rule_revision(db, rule, "Aegis system")
+            if rules_without_history:
+                db.commit()
 
     app = FastAPI(title="Aegis Vanguard API", version="1.0.0")
     app.state.engine = engine
+    app.state.database_status = {
+        "kind": engine.dialect.name,
+        "persistent_database_configured": engine.dialect.name != "sqlite",
+        "durability": "managed_database_required" if engine.dialect.name == "sqlite" else "external_database",
+        **_migration_status(engine),
+    }
     app.state.analysis_provider = provider if provider is not None else configured_provider()
     configured_origins = [
         origin.strip().rstrip("/")
@@ -822,8 +877,8 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
             yield db
 
     @app.get("/api/health")
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def health() -> dict[str, object]:
+        return {"status": "ok", "database": app.state.database_status}
 
     @app.get("/api/intelligence/status")
     def intelligence_status(db: Session = Depends(get_db)) -> dict[str, object]:
@@ -831,9 +886,12 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
         latest = db.scalar(
             select(AnalysisRunModel).order_by(AnalysisRunModel.created_at.desc(), AnalysisRunModel.id.desc())
         )
-        last_success = None
-        if latest is not None and latest.outcome == "succeeded":
-            last_success = latest.created_at
+        last_success = db.scalar(
+            select(AnalysisRunModel.created_at)
+            .where(AnalysisRunModel.outcome == "succeeded")
+            .order_by(AnalysisRunModel.created_at.desc(), AnalysisRunModel.id.desc())
+            .limit(1)
+        )
         return {
             "provider": getattr(active_provider, "provider_name", "openai") if active_provider else "none",
             "model": getattr(active_provider, "model", os.getenv("OPENAI_MODEL", "gpt-4.1-mini")) if active_provider else None,
@@ -843,6 +901,7 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
             "last_failure_code": latest.failure_code if latest else None,
             "last_successful_request_at": last_success,
             "live_ai_claim": latest is not None and latest.outcome == "succeeded",
+            "database": app.state.database_status,
         }
 
     @app.get("/api/dashboard")
@@ -961,7 +1020,7 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
             }
             for item in draft.evidence
         ]
-        latest = max(draft.analysis_runs, key=lambda run: (run.created_at, run.id), default=None)
+        latest = _latest_analysis_for_draft(draft)
         current_version = max((version.version for version in draft.versions), default=1)
         if latest is not None and (
             latest.content_version != current_version
@@ -1139,8 +1198,7 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
             raise HTTPException(status_code=422, detail="A term is required for terminology and required-language rules.")
         rule = BrandRuleModel(**data.model_dump())
         db.add(rule)
-        db.commit()
-        db.refresh(rule)
+        db.flush()
         record_rule_revision(db, rule, "Local reviewer")
         db.add(AuditEventModel(
             action="Brand rule created", actor="Local reviewer", target_type="brand_rule",
@@ -1199,6 +1257,138 @@ def create_app(database_url: str | None = None, provider: AnalysisProvider | Non
     ) -> list[dict[str, object]]:
         events = db.scalars(select(AuditEventModel).order_by(AuditEventModel.created_at.desc(), AuditEventModel.id.desc()).limit(limit))
         return [_audit_dict(event) for event in events]
+
+    def build_learning_payload(db: Session, days: int) -> dict[str, object]:
+        window_end = utc_now()
+        window_start = window_end - timedelta(days=days)
+        decisions = list(db.scalars(
+            select(ReviewDecisionModel)
+            .where(ReviewDecisionModel.created_at >= window_start)
+            .order_by(ReviewDecisionModel.created_at.desc(), ReviewDecisionModel.id.desc())
+        ))
+        latest_by_draft: dict[int, ReviewDecisionModel] = {}
+        for decision in decisions:
+            latest_by_draft.setdefault(decision.draft_id, decision)
+        completed = [
+            decision for decision in latest_by_draft.values()
+            if decision.action in {"approve", "reject"}
+        ]
+        completed.sort(key=lambda decision: decision.id)
+
+        patterns: dict[tuple[int | None, str, str], dict[str, object]] = {}
+        for decision in completed:
+            findings = db.scalars(
+                select(FindingModel).where(FindingModel.draft_id == decision.draft_id)
+            )
+            seen_on_draft: set[tuple[int | None, str, str]] = set()
+            for finding in findings:
+                key = (finding.policy_id, finding.category, finding.title)
+                if key in seen_on_draft:
+                    continue
+                seen_on_draft.add(key)
+                pattern = patterns.setdefault(key, {
+                    "policy_id": finding.policy_id,
+                    "category": finding.category,
+                    "finding_title": finding.title,
+                    "draft_ids": [],
+                    "finding_ids": [],
+                    "decision_ids": [],
+                })
+                pattern["draft_ids"].append(decision.draft_id)
+                pattern["finding_ids"].append(finding.id)
+                pattern["decision_ids"].append(decision.id)
+
+        recommendations = []
+        for key, pattern in sorted(patterns.items(), key=lambda item: str(item[0])):
+            if len(pattern["draft_ids"]) < 2:
+                continue
+            rule = db.get(BrandRuleModel, key[0]) if key[0] is not None else None
+            recommendations.append({
+                "key": f"{key[0] or 'unlinked'}:{key[1]}:{re.sub(r'[^a-z0-9]+', '-', key[2].lower()).strip('-')}",
+                "recommendation": (
+                    f"Review whether the policy '{rule.name}' should be clarified for this recurring finding."
+                    if rule else "Review whether a policy should address this recurring finding."
+                ),
+                "basis": pattern,
+                "requires_human_policy_review": True,
+                "automatically_applied": False,
+            })
+
+        return {
+            "window": {"starts_at": window_start, "ends_at": window_end, "days": days},
+            "basis": {
+                "method": "latest completed approve/reject decision per draft within the selected window; recurring patterns count once per draft",
+                "completed_decisions": len(completed),
+                "decision_ids": [decision.id for decision in completed],
+                "unverified_actor_labels": True,
+            },
+            "recommendations": recommendations,
+            "notice": "Descriptive patterns from local review records. They do not establish causation and never change active policy.",
+        }
+
+    def learning_run_dict(run: GovernanceLearningRunModel) -> dict[str, object]:
+        return {
+            "run_id": run.id,
+            "recorded_at": run.created_at,
+            "window": {
+                "starts_at": run.window_starts_at,
+                "ends_at": run.window_ends_at,
+                "days": run.window_days,
+            },
+            "basis": json.loads(run.basis_json),
+            "recommendations": json.loads(run.recommendations_json),
+            "notice": "Descriptive patterns from local review records. They do not establish causation and never change active policy.",
+        }
+
+    @app.get("/api/governance/learning")
+    def governance_learning(
+        days: int = Query(default=90, ge=1, le=365),
+        db: Session = Depends(get_db),
+    ) -> dict[str, object]:
+        """Return a traceable preview; it records only when explicitly generated."""
+        return {"run_id": None, "recorded_at": None, **build_learning_payload(db, days)}
+
+    @app.post("/api/governance/learning")
+    def record_governance_learning(
+        days: int = Query(default=90, ge=1, le=365),
+        db: Session = Depends(get_db),
+    ) -> dict[str, object]:
+        payload = build_learning_payload(db, days)
+        run = GovernanceLearningRunModel(
+            window_days=days,
+            window_starts_at=payload["window"]["starts_at"],
+            window_ends_at=payload["window"]["ends_at"],
+            basis_json=json.dumps(payload["basis"]),
+            recommendations_json=json.dumps(payload["recommendations"]),
+        )
+        db.add(run)
+        db.flush()
+        db.add(AuditEventModel(
+            action="Governance learning snapshot recorded",
+            actor="Aegis rules engine",
+            target_type="governance_learning_run",
+            target_id=run.id,
+            target_title=f"Review patterns · {days} days",
+            details=(
+                f"{payload['basis']['completed_decisions']} completed decisions; "
+                f"{len(payload['recommendations'])} human review suggestions."
+            ),
+        ))
+        db.commit()
+        db.refresh(run)
+        return learning_run_dict(run)
+
+    @app.get("/api/governance/learning/runs")
+    def governance_learning_runs(
+        limit: int = Query(default=20, ge=1, le=100),
+        db: Session = Depends(get_db),
+    ) -> list[dict[str, object]]:
+        runs = db.scalars(
+            select(GovernanceLearningRunModel)
+            .order_by(GovernanceLearningRunModel.created_at.desc(), GovernanceLearningRunModel.id.desc())
+            .limit(limit)
+        )
+        return [learning_run_dict(run) for run in runs]
 
     return app
 
