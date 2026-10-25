@@ -413,7 +413,7 @@ class ApiWorkflowTests(unittest.TestCase):
     def test_health_reports_sqlite_and_migration_status_without_claiming_durability(self) -> None:
         status = self.client.get("/api/health").json()
         self.assertEqual(status["database"]["kind"], "sqlite")
-        self.assertFalse(status["database"]["persistent_database_configured"])
+        self.assertFalse(status["database"]["non_sqlite_database_configured"])
         self.assertEqual(status["database"]["durability"], "managed_database_required")
 
     def test_vercel_refuses_to_start_without_explicit_database_url(self) -> None:
@@ -448,7 +448,7 @@ class ApiWorkflowTests(unittest.TestCase):
             with TestClient(app) as client:
                 health = client.get("/api/health").json()
                 self.assertTrue(health["database"]["migrations_applied"])
-                self.assertFalse(health["database"]["persistent_database_configured"])
+                self.assertFalse(health["database"]["non_sqlite_database_configured"])
                 self.assertGreater(len(client.get("/api/brand-rules").json()), 0)
         finally:
             app.state.engine.dispose()

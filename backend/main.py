@@ -852,8 +852,8 @@ def create_app(
     app.state.engine = engine
     app.state.database_status = {
         "kind": engine.dialect.name,
-        "persistent_database_configured": engine.dialect.name != "sqlite",
-        "durability": "managed_database_required" if engine.dialect.name == "sqlite" else "external_database",
+        "non_sqlite_database_configured": engine.dialect.name != "sqlite",
+        "durability": "managed_database_required" if engine.dialect.name == "sqlite" else "external_provider_unverified",
         **_migration_status(engine),
     }
     app.state.analysis_provider = provider if provider is not None else configured_provider()

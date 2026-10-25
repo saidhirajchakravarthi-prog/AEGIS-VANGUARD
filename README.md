@@ -93,7 +93,7 @@ Set `AEGIS_DATABASE_URL` to managed PostgreSQL in Vercel Project Settings before
 
 - `OPENAI_API_KEY` — optional; enter only in Vercel's secret environment-variable UI. `OPENAI_MODEL` is optional and defaults to `gpt-4.1-mini`.
 
-Vercel serverless storage under `/tmp` is ephemeral and not a durable database. `/api/health` and `/api/intelligence/status` report the database kind, whether a non-SQLite database is configured, and whether Alembic has been applied. This status does not independently verify that a database provider offers backups or durability. The local `backend\aegis.db` is not copied to the public host. Keep `.env` and API keys out of GitHub; `.env` is ignored.
+Vercel serverless storage under `/tmp` is ephemeral and not a durable database. `/api/health` and `/api/intelligence/status` report the database kind, whether a non-SQLite database is configured, and whether Alembic has been applied. Even a PostgreSQL connection is labeled `external_provider_unverified`; the app cannot independently verify provider backups or durability. The local `backend\aegis.db` is not copied to the public host. Keep `.env` and API keys out of GitHub; `.env` is ignored.
 
 After deployment, verify `/api/health` and `/api/intelligence/status`. The application must continue to report rules-only until a valid key is configured and an actual model request succeeds. Do not report live AI based solely on key configuration. The production API remains unauthenticated until a supported identity provider is provisioned and enforced; the frontend is not an access-control boundary.
 
