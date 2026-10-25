@@ -70,16 +70,18 @@ Evidence URLs and excerpts are stored as **user-supplied and unverified**. This 
 
 The app is in **local single-user mode**. Authentication, user identity, and role-based permissions are not implemented. Reviewer attribution is a local label, not an authenticated identity. This deployment is intended for local evaluation, not a multi-user production environment.
 
-## Railway hackathon deployment
+## Vercel hackathon deployment
 
-The repository can be deployed as two Railway services from the same GitHub repository:
+The `vercel.json`, root `requirements.txt`, and `api/index.py` configure the Vite build and FastAPI function in one project. Import the GitHub repository in Vercel with the repository root as the project root. The production frontend calls the same-origin `/api` path; local development continues to use `http://127.0.0.1:8000/api`.
 
-1. Create a backend service with root directory `/backend`, install command `pip install -r requirements.txt`, and start command `uvicorn main:app --host 0.0.0.0 --port $PORT`.
-2. Generate a public domain for the backend. Add `OPENAI_API_KEY` only in the backend service's Railway Variables. Until a valid key is added and a real request succeeds, the app remains in rules-only mode.
-3. Create a frontend service from the repository root. Use build command `npm ci && npm run build` and start command `npm run preview -- --host 0.0.0.0 --port $PORT`. Set the build variable `VITE_API_URL` to `https://<backend-domain>/api`.
-4. Generate a public domain for the frontend. Set backend variable `AEGIS_CORS_ORIGINS` to exactly `https://<frontend-domain>` and redeploy both services.
+Set these Production environment variables in Vercel Project Settings before deploying:
 
-Railway's default filesystem is ephemeral unless a volume is attached. Without a volume and an `AEGIS_DATABASE_URL` pointing to that volume, database writes can be lost on redeploy/restart. This deployment does not copy the local `backend\aegis.db` to a public host. Keep `.env` and API keys out of GitHub; `.env` is ignored.
+- `AEGIS_DATABASE_URL=sqlite:////tmp/aegis.db`
+- `OPENAI_API_KEY` — optional; enter only in Vercel's secret environment-variable UI. `OPENAI_MODEL` is optional and defaults to `gpt-4.1-mini`.
+
+Vercel serverless storage under `/tmp` is ephemeral and not a durable database: data can disappear between function instances or deployments. This is suitable only for a short-lived demo, not production governance records. The local `backend\aegis.db` is not copied to the public host. Keep `.env` and API keys out of GitHub; `.env` is ignored.
+
+After deployment, verify `/api/health` and `/api/intelligence/status`. The application must continue to report rules-only until a valid key is configured and an actual model request succeeds. Do not report live AI based solely on key configuration.
 
 ## API highlights
 
